@@ -1,0 +1,16 @@
+name: astrbot_plugin_schedule_guard
+display_name: 主动消息日程判断
+author: Sun-XT9527
+version: 0.1.0
+desc: 主动消息发送前结合聊天上下文与 LivingMemory 判断忙闲，保留检查记录。
+short_desc: 发送主动消息前，先用聊天与记忆判断用户忙闲。
+repo: https://github.com/Sun-XT9527/astrbot_plugin_schedule_guard
+social_link: https://github.com/Sun-XT9527
+tags:
+  - 日程
+  - 长期记忆
+  - 主动消息
+astrbot_version: ">=4.29.1,<5"
+support_platforms:
+  - qq_official
+  - aiocqhttp

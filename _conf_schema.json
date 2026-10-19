@@ -1,0 +1,7 @@
+{
+  "enabled": {"description": "启用日程拦截", "type": "bool", "default": false, "hint": "先在管理页模拟检查，再启用。明确忙碌时跳过本轮，其余情况放行。"},
+  "session_list": {"description": "允许检查的私聊会话 UMO", "type": "list", "default": [], "hint": "只填写已配置主动消息的完整私聊 UMO。空列表不检查任何会话。"},
+  "provider_id": {"description": "判断模型", "type": "string", "default": "", "_special": "select_provider", "hint": "留空使用当前会话的对话模型，不使用人格、不执行工具。"},
+  "judge_timeout_seconds": {"description": "判断超时（秒）", "type": "int", "default": 30},
+  "memory_timeout_seconds": {"description": "记忆检索超时（秒）", "type": "int", "default": 10}
+}

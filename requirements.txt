@@ -1,0 +1,3 @@
+# Provided by the supported AstrBot runtime; listed for dependency discovery.
+quart>=0.20
+starlette>=0.40
