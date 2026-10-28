@@ -36,6 +36,7 @@ class ScheduleGuardPlugin(Star):
             ("view", self.view, "GET"),
             ("stats", self.stats, "GET"),
             ("records", self.records, "GET"),
+            ("simulations/delete", self.delete_simulations, "POST"),
             ("check", self.simulate, "POST"),
             ("bootstrap", self.bootstrap, "POST"),
         ):
@@ -98,6 +99,33 @@ class ScheduleGuardPlugin(Star):
             "status": "ok",
             "data": {"records": await asyncio.to_thread(self.guard.store.list)},
         }
+
+    async def delete_simulations(self):
+        try:
+            body = await request.get_json(silent=True)
+            if not isinstance(body, dict):
+                raise ValueError("请指定要删除的模拟记录，或明确选择清空模拟记录")
+            event_id = body.get("event_id")
+            clear_all = body.get("all") is True
+            if clear_all:
+                if "event_id" in body:
+                    raise ValueError("单条删除和清空模拟记录不能同时使用")
+            elif (
+                not isinstance(event_id, str)
+                or not event_id.strip()
+                or len(event_id) > 200
+                or "all" in body
+            ):
+                raise ValueError("请指定有效的模拟记录编号")
+            deleted = await asyncio.to_thread(
+                self.guard.store.delete_simulations, None if clear_all else event_id
+            )
+            return {"status": "ok", "data": {"deleted": deleted}}
+        except ValueError as exc:
+            return {"status": "error", "message": str(exc)}
+        except Exception as exc:
+            logger.warning(f"[ScheduleGuard] Failed to delete simulations: {type(exc).__name__}")
+            return {"status": "error", "message": "删除模拟记录失败，请稍后重试"}
 
     async def simulate(self):
         try:

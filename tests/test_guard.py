@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import importlib.util
+import inspect
 import json
 import logging
 import os
 import sys
 import tempfile
+import traceback
 import types
 import unittest
 from datetime import datetime, timedelta
@@ -70,6 +73,9 @@ class FakeEvent:
 
     def stop_event(self):
         self.stopped = True
+
+    def is_stopped(self):
+        return self.stopped
 
 
 class FakeContext:
@@ -165,6 +171,51 @@ class EngineTests(unittest.TestCase):
             {"role": "user", "content": "我明天上课"},
         ]
         self.assertEqual(bootstrap_candidate(history), TABLE)
+
+
+class StorageDeletionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.store = AuditStore(Path(self.temp.name) / "checks.db")
+        for event_id, mode in (
+            ("simulation:one", "simulation"),
+            ("simulation:two", "simulation"),
+            ("proactive:live", "live"),
+        ):
+            self.store.save(
+                {
+                    "event_id": event_id,
+                    "session_id": UMO,
+                    "checked_at": "2026-10-21T10:00:00+08:00",
+                    "mode": mode,
+                    "status": "busy",
+                    "delivery": "simulation" if mode == "simulation" else "skipped_busy",
+                }
+            )
+
+    def test_single_delete_persists_without_affecting_other_records(self):
+        self.assertEqual(self.store.delete_simulations("simulation:one"), 1)
+        self.assertEqual(self.store.delete_simulations("simulation:one"), 0)
+        reopened = AuditStore(self.store.path)
+        self.assertEqual(
+            {item["event_id"] for item in reopened.list()}, {"simulation:two", "proactive:live"}
+        )
+        self.assertEqual(reopened.stats(), {"simulation:simulation": 1, "live:skipped_busy": 1})
+
+    def test_live_id_or_injected_id_cannot_delete_audit_records(self):
+        for event_id in ("proactive:live", "missing", "' OR 1=1 --"):
+            self.assertEqual(self.store.delete_simulations(event_id), 0)
+        self.assertEqual(len(self.store.list()), 3)
+
+    def test_clear_removes_simulations_beyond_display_limit_and_keeps_live_payload(self):
+        live = next(item for item in self.store.list() if item["mode"] == "live")
+        for index in range(105):
+            self.store.save({**live, "event_id": f"simulation:{index}", "mode": "simulation"})
+        self.assertEqual(len(self.store.list()), 100)
+        self.assertEqual(self.store.delete_simulations(), 107)
+        self.assertEqual(AuditStore(self.store.path).list(), [live])
+        self.assertEqual(self.store.delete_simulations(), 0)
 
 
 class GuardTests(unittest.IsolatedAsyncioTestCase):
@@ -391,17 +442,62 @@ def load_original_flow(path):
     return module.ProactiveCoreMixin
 
 
+def load_original_adapter(root, guard):
+    """Load installed request and hook methods with isolated provider dependencies.
+
+    Args:
+        root: The installed Proactive Chat directory or an unchanged snapshot.
+        guard: The guard whose hooks are registered in the test registry.
+
+    Returns:
+        Original executable methods with a synthetic hook registry.
+    """
+    methods = {
+        "_generate_llm_response",
+        "_dispatch_llm_request_hooks",
+        "_dispatch_llm_response_hooks",
+    }
+    adapter = ast.parse((root / "core" / "llm_adapter.py").read_text(encoding="utf-8"))
+    events = ast.parse((root / "core" / "proactive_event.py").read_text(encoding="utf-8"))
+    nodes = [node for node in ast.walk(adapter) if getattr(node, "name", None) in methods]
+    nodes += [node for node in events.body if getattr(node, "name", None) == "dispatch_event_hook"]
+    registry = NS(
+        get_handlers_by_event_type=lambda event_type, **kwargs: {
+            "waiting": [],
+            "request": [NS(handler=guard.on_request)],
+            "response": [NS(handler=guard.on_response)],
+        }[event_type]
+    )
+    namespace = {
+        "asyncio": asyncio,
+        "inspect": inspect,
+        "traceback": traceback,
+        "logger": LOG,
+        "format_current_time": lambda timezone: datetime.now(timezone).isoformat(),
+        "EventType": NS(
+            OnWaitingLLMRequestEvent="waiting",
+            OnLLMRequestEvent="request",
+            OnLLMResponseEvent="response",
+        ),
+        "star_handlers_registry": registry,
+    }
+    module = ast.Module(
+        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)]
+        + nodes,
+        type_ignores=[],
+    )
+    exec(compile(ast.fix_missing_locations(module), str(root / "core"), "exec"), namespace)
+    return namespace
+
+
 @unittest.skipUnless(
     os.environ.get("PROACTIVE_PLUGIN_ROOT"),
     "Set PROACTIVE_PLUGIN_ROOT for the installed v1.2.6 integration test",
 )
 class OriginalFlowTests(unittest.IsolatedAsyncioTestCase):
-    async def test_busy_round_has_no_body_tts_send_count_or_archive_but_reschedules(
-        self,
-    ):
-        mixin = load_original_flow(
-            Path(os.environ["PROACTIVE_PLUGIN_ROOT"]) / "core" / "chat_flow.py"
-        )
+    async def test_original_flow_busy_stops_before_provider_and_free_unknown_continue(self):
+        root = Path(os.environ["PROACTIVE_PLUGIN_ROOT"])
+        mixin = load_original_flow(root / "core" / "chat_flow.py")
 
         class Harness(mixin):
             def __init__(self):
@@ -412,6 +508,7 @@ class OriginalFlowTests(unittest.IsolatedAsyncioTestCase):
                 self.manual_trigger_sessions = set()
                 self.web_admin_server = None
                 self._terminating = False
+                self.timezone = BEIJING
                 self.body = self.tts = self.sends = self.archives = self.schedules = 0
 
             def _normalize_session_id(self, s):
@@ -437,12 +534,33 @@ class OriginalFlowTests(unittest.IsolatedAsyncioTestCase):
             def _build_proactive_event(self, s):
                 return self.event
 
-            async def _generate_llm_response(self, *args, **kwargs):
-                await self.guard.on_request(kwargs["event"], NS(contexts=HISTORY))
-                if kwargs["event"].stopped:
-                    return None, ""
+            def _sanitize_history_content(self, history):
+                return history
+
+            def _build_extra_content_parts(self, **kwargs):
+                return []
+
+            async def _resolve_chat_provider(self, session_id):
+                return object()
+
+            def _build_provider_request(self, **kwargs):
+                return NS(**kwargs, extra_user_content_parts=[])
+
+            async def _invoke_provider(self, provider, req):
                 self.body += 1
-                return NS(), ""
+                return NS(completion_text="Synthetic proactive message")
+
+            def _extract_response_text(self, response):
+                return response.completion_text
+
+            def _extract_response_chain(self, response):
+                return None
+
+            def _resolve_final_user_prompt(self, req, fallback):
+                return req.prompt
+
+            def _parse_session_id(self, session_id):
+                return session_id.split(":", 2)
 
             async def _schedule_next_chat_and_save(self, s):
                 self.schedules += 1
@@ -450,34 +568,53 @@ class OriginalFlowTests(unittest.IsolatedAsyncioTestCase):
             async def _send_proactive_message(self, *a, **k):
                 self.tts += 1
                 self.sends += 1
+                self.event._has_send_oper = True
+                await self.guard.after_sent(self.event)
                 return True
 
             async def _finalize_and_reschedule(self, *a, **k):
                 self.archives += 1
+                self.session_data[UMO]["unanswered_count"] += 1
+                self.schedules += 1
 
             def _get_session_log_str(self, *a):
                 return UMO
 
-        owner = Harness()
-        with tempfile.TemporaryDirectory() as directory:
-            context = FakeContext(owner)
-            owner.guard = GuardService(
-                context,
-                {"enabled": True, "session_list": [UMO]},
-                AuditStore(Path(directory) / "checks.db"),
-                LOG,
-            )
+        for status in ("busy", "free", "unknown"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                owner = Harness()
+                context = FakeContext(owner, [output(status)])
+                owner.guard = GuardService(
+                    context,
+                    {"enabled": True, "session_list": [UMO]},
+                    AuditStore(Path(directory) / "checks.db"),
+                    LOG,
+                )
 
-            async def recall(*args):
-                return [], []
+                async def recall(*args):
+                    return [], []
 
-            owner.guard.recall = recall
-            owner.event = FakeEvent(owner)
-            await owner.check_and_chat(UMO)
-            self.assertEqual((owner.body, owner.tts, owner.sends, owner.archives), (0, 0, 0, 0))
-            self.assertEqual(owner.schedules, 1)
-            self.assertEqual(owner.session_data[UMO]["unanswered_count"], 2)
-            self.assertEqual(owner.guard.store.list()[0]["delivery"], "skipped_busy")
+                owner.guard.recall = recall
+                owner.event = FakeEvent(owner)
+                original_methods = load_original_adapter(root, owner.guard)
+                for name in (
+                    "_generate_llm_response",
+                    "_dispatch_llm_request_hooks",
+                    "_dispatch_llm_response_hooks",
+                ):
+                    setattr(owner, name, types.MethodType(original_methods[name], owner))
+                await owner.check_and_chat(UMO)
+                expected = 0 if status == "busy" else 1
+                self.assertEqual(
+                    (owner.body, owner.tts, owner.sends, owner.archives), (expected,) * 4
+                )
+                self.assertEqual(len(context.calls), 1)
+                self.assertEqual(owner.schedules, 1)
+                self.assertEqual(owner.session_data[UMO]["unanswered_count"], 2 + expected)
+                self.assertEqual(
+                    owner.guard.store.list()[0]["delivery"],
+                    "skipped_busy" if status == "busy" else "sent",
+                )
 
 
 if __name__ == "__main__":

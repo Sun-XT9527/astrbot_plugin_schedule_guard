@@ -83,3 +83,21 @@ class AuditStore:
                     "SELECT mode,delivery,COUNT(*) FROM checks GROUP BY mode,delivery"
                 )
             }
+
+    def delete_simulations(self, event_id: str | None = None) -> int:
+        """Delete simulated checks while retaining all live audit records.
+
+        Args:
+            event_id: A single simulation ID, or None to clear all simulations.
+
+        Returns:
+            The number of deleted simulation records.
+        """
+        with self.connect() as db:
+            if event_id is None:
+                cursor = db.execute("DELETE FROM checks WHERE mode='simulation'")
+            else:
+                cursor = db.execute(
+                    "DELETE FROM checks WHERE mode='simulation' AND event_id=?", (event_id,)
+                )
+            return cursor.rowcount

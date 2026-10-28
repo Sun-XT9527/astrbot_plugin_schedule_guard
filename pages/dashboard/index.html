@@ -6,5 +6,5 @@
   <section class="cards"><article><span>日程拦截</span><strong id="enabled">—</strong><small id="model">—</small></article><article><span>因忙碌跳过</span><strong id="skipped">—</strong><small>真实触发，不含模拟检查</small></article><article><span>确认已发送</span><strong id="sent">—</strong><small>根据实际发送标记确认</small></article></section>
   <section class="panel"><h2>下一次主动检查</h2><div id="next">—</div></section>
   <section class="panel"><h2>模拟一个时间</h2><p class="muted">只运行判断，不生成正式消息、不调用语音、不向 QQ 发送。</p><div class="form"><label>私聊会话<select id="session"></select></label><label>北京时间<input id="at" type="datetime-local"></label><button id="check" class="primary">模拟检查</button><button id="bootstrap">保存并验证已有文字日程</button></div><div id="simulation" aria-live="polite"></div></section>
-  <section class="panel"><h2>检查记录</h2><p class="muted">“已放行”不代表已经发送。展开一条记录可查看判断依据。</p><div id="records"></div></section>
+  <section class="panel"><h2>检查记录</h2><p class="muted">“已放行”不代表已经发送。展开一条记录可查看判断依据。模拟记录可单条删除或全部清空，真实触发记录会保留。</p><button id="clear-simulations" disabled>清空模拟记录</button><div id="records"></div></section>
 </main><script defer src="app.js"></script></body></html>
